@@ -3,7 +3,7 @@
 基于 **Python + FastAPI + Decimal/Fraction** 的工程单位换算服务。
 支持长度、质量、时间、温度四维量纲核对，复合单位表达式，°C / °F 偏移温标换算，
 由多条乘积等式推断未知变量的四维量纲，从具名量中搜索最简无量纲乘积，
-以及独立测量值乘积的一阶合成标准不确定度传播。
+独立测量值乘积的一阶合成标准不确定度传播，以及带单位线性方程组的精确求解。
 
 ## 启动（单条命令）
 
@@ -168,6 +168,52 @@ curl -X POST http://localhost:8000/propagate-product \
 # {"value":"6","uncertainty":"0.5"}
 ```
 
+### POST /solve-quantities
+
+求解**带单位的线性方程组**。请求体含 **1～8 个**互异变量 `variables`
+（`{name, unit}`，`name` 非空白）与 **1～16 条**方程 `equations`；每条方程含
+非空 `terms` 与右侧 `rhs`，项为 `{var, coefficient, unit}`（`var` 必须引用
+已声明的变量名），右侧为 `{value, unit}`。`coefficient`、`value` 为有限十进制
+字符串，所有 `unit` 为单位表达式（不接受 `°C` / `°F`），`unit="1"` 表示无量纲：
+
+```json
+{
+  "variables": [
+    {"name": "x", "unit": "m"},
+    {"name": "y", "unit": "s"}
+  ],
+  "equations": [
+    {"terms": [{"var": "x", "coefficient": "1", "unit": "1"},
+               {"var": "y", "coefficient": "2", "unit": "m/s"}],
+     "rhs": {"value": "10", "unit": "m"}},
+    {"terms": [{"var": "x", "coefficient": "1", "unit": "1"},
+               {"var": "y", "coefficient": "-1", "unit": "m/s"}],
+     "rhs": {"value": "2", "unit": "m"}}
+  ]
+}
+```
+
+求解规则：逐项核对**系数单位 × 变量单位**与该式右侧的量纲一致；把系数与
+右侧值按单位比例换算到基本单位，组成有理系数增广矩阵，用 `Fraction` 做
+**Gauss-Jordan 精确消元**。仅当存在**唯一解**时返回 `values`（**按变量名
+排序**），数值换回变量声明的单位，按 **ROUND_HALF_EVEN** 保留最多
+**12 位小数**并以字符串给出。上例即 `x = 14/3 m`、`y = 8/3 s`：
+
+```json
+{"values": {"x": "4.666666666667", "y": "2.666666666667"}}
+```
+
+```bash
+curl -X POST http://localhost:8000/solve-quantities \
+  -H 'Content-Type: application/json' \
+  -d '{"variables":[{"name":"d","unit":"km"}],"equations":[{"terms":[{"var":"d","coefficient":"1","unit":"1"}],"rhs":{"value":"3000","unit":"m"}}]}'
+# {"values":{"d":"3"}}
+```
+
+方程**无解**（`no_solution`）与**欠定**（`underdetermined`，含
+`free_variables` 列表）均返回 422 并以不同的 `error` 区分；引用未声明变量、
+数值非法、单位语法/量纲错误同样返回 422（见下表）。
+
 ## 单位与表达式语法
 
 - 支持单位：`m`、`km`、`cm`、`mm`（长度）；`kg`、`g`（质量）；`s`、`min`、`h`（时间）；`K`、`°C`、`°F`（温度）。
@@ -202,10 +248,12 @@ curl -X POST http://localhost:8000/propagate-product \
 | `inconsistent_constraints` | 约束互相矛盾（如同一变量同时被约束为 `m` 与 `s`），含首个矛盾维度 `dimension` |
 | `underdetermined` | 约束不足，存在无法唯一确定的变量，含 `free_variables` 列表 |
 | `fractional_dimensions` | 解唯一但含分数指数（如 `x^2 = m`），含相关 `variables` 列表 |
-| `offset_temperature_not_allowed` | `/infer-dimensions` 的单位因子或 `/propagate-product` 的单位使用了 °C / °F；含坐标（及单位表达式内 `position`） |
+| `offset_temperature_not_allowed` | `/infer-dimensions` 的单位因子、`/propagate-product` 或 `/solve-quantities` 的单位使用了 °C / °F；含坐标（及单位表达式内 `position`） |
 | `no_dimensionless_group` | `/dimensionless-group` 在 -6～6 指数范围内不存在非平凡无量纲组合 |
 | `invalid_uncertainty` | `/propagate-product` 因子的 `uncertainty` 不是有限十进制字符串或为负，含 `factor` |
 | `zero_negative_power` | `/propagate-product` 的零值因子取了负幂，含 `factor` |
+| `unknown_variable` | `/solve-quantities` 的项引用了未声明的变量名，含 `var`、`equation`、`term` |
+| `no_solution` | `/solve-quantities` 的方程组互相矛盾，不存在解 |
 
 `/infer-dimensions` 的单位因子语法错误同样返回 `syntax_error`，并带
 `equation`（等式下标）、`side`（`left`/`right`）、`factor`（因子下标）
@@ -221,6 +269,14 @@ curl -X POST http://localhost:8000/propagate-product \
 `field: "to"`（目标单位）与 0 起始的 `position`；`invalid_value` /
 `invalid_uncertainty` / `zero_negative_power` 均带 `factor`；
 `factors` 数量不在 1～8、`power` 越界等请求体问题由 FastAPI 校验返回 422。
+
+`/solve-quantities` 的单位错误同样返回 `syntax_error` /
+`offset_temperature_not_allowed`，坐标字段为 `variable`（变量下标）、
+`equation` + `term`（等式与项下标）或 `equation` + `field: "rhs"`
+（该式右侧），并带 0 起始的 `position`；`invalid_value`（`coefficient`
+或右侧 `value` 非法）与 `dimension_mismatch`（某项量纲与右侧不符）带
+相同的等式/项坐标；`variables` 数量不在 1～8、`equations` 数量不在
+1～16、`terms` 为空、`name` 空白或重复等请求体问题由 FastAPI 校验返回 422。
 
 请求体缺字段、类型错误等由 FastAPI 校验，同样返回 422。
 
@@ -240,7 +296,8 @@ app/
   dimensions.py     # 跨等式线性约束（有理 Gauss-Jordan 消元）与四维量纲推断
   dimensionless.py  # 最简无量纲乘积搜索（中途相遇枚举 ±6 整数指数）
   propagation.py    # 独立测量值乘积的一阶合成标准不确定度传播
-  main.py           # FastAPI 应用（POST /convert、/infer-dimensions、/dimensionless-group、/propagate-product、GET /health）
+  solver.py         # 带单位线性方程组求解（量纲核对 + 有理 Gauss-Jordan 精确消元）
+  main.py           # FastAPI 应用（POST /convert、/infer-dimensions、/dimensionless-group、/propagate-product、/solve-quantities、GET /health）
 tests/              # pytest 测试（核心逻辑 + HTTP API）
 Dockerfile
 docker-compose.yml

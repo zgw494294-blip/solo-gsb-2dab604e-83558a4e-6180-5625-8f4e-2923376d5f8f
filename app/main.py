@@ -11,6 +11,10 @@ POST /dimensionless-group 接收 1～8 个具名量 {"quantities": [{name, unit}
 
 POST /propagate-product 接收 1～8 个独立测量值 {"factors": [...], "to": "..."}，
 计算乘积 y=∏x_i^power 及其一阶合成标准不确定度；非法输入返回 422。
+
+POST /solve-quantities 接收 1～8 个互异变量 {"variables": [...]} 与 1～16 条
+带单位线性方程 {"equations": [...]}，用有理数精确消元求解；仅唯一解返回，
+语法/量纲错误、无解与欠定均返回 422。
 """
 
 from fastapi import FastAPI, HTTPException
@@ -45,13 +49,26 @@ from .propagation import (
     parse_target_unit,
     propagate_product,
 )
+from .solver import (
+    EquationInput as SolveEquationInput,
+    InvalidNumberError,
+    RhsInput,
+    SolveError,
+    TermDimensionError,
+    TermInput,
+    UnitError as SolveUnitError,
+    UnknownVariableError,
+    VariableInput,
+    solve_quantities,
+)
 
 app = FastAPI(
     title="Unit Converter API",
-    version="1.3.0",
+    version="1.4.0",
     description="长度 / 质量 / 时间 / 温度四维量纲的单位换算，"
                 "支持复合单位表达式、°C / °F 偏移温标、量纲推断、"
-                "最简无量纲乘积搜索与乘积一阶不确定度传播。",
+                "最简无量纲乘积搜索、乘积一阶不确定度传播与"
+                "带单位线性方程组求解。",
 )
 
 
@@ -159,6 +176,62 @@ class PropagateProductRequest(BaseModel):
 class PropagateProductResponse(BaseModel):
     value: str
     uncertainty: str
+
+
+class SolveVariableModel(BaseModel):
+    """一个待求解变量：name 非空白且互异（在请求层校验），unit 为单位表达式，
+    "1" 表示无量纲。"""
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=64)
+    unit: str = Field(min_length=1, max_length=2_000)
+
+
+class SolveTermModel(BaseModel):
+    """方程左侧的一项：var 引用已声明变量，coefficient 为有限十进制字符串。"""
+    model_config = ConfigDict(extra="forbid")
+
+    var: str = Field(min_length=1, max_length=64)
+    coefficient: str = Field(max_length=10_000, description="有限十进制字符串")
+    unit: str = Field(min_length=1, max_length=2_000, description="单位表达式；"
+                                                                  '"1" 表示无量纲')
+
+
+class SolveRhsModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    value: str = Field(max_length=10_000, description="有限十进制字符串")
+    unit: str = Field(min_length=1, max_length=2_000, description="单位表达式；"
+                                                                  '"1" 表示无量纲')
+
+
+class SolveEquationModel(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    terms: list[SolveTermModel] = Field(min_length=1, max_length=64)
+    rhs: SolveRhsModel
+
+
+class SolveQuantitiesRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    variables: list[SolveVariableModel] = Field(min_length=1, max_length=8)
+    equations: list[SolveEquationModel] = Field(min_length=1, max_length=16)
+
+    @model_validator(mode="after")
+    def _names_non_blank_and_distinct(self) -> "SolveQuantitiesRequest":
+        seen: set[str] = set()
+        for variable in self.variables:
+            if not variable.name.strip():
+                raise ValueError('"name" must not be blank')
+            if variable.name in seen:
+                raise ValueError(f'duplicate "name": {variable.name!r}')
+            seen.add(variable.name)
+        return self
+
+
+class SolveQuantitiesResponse(BaseModel):
+    values: dict[str, str]
 
 
 def _unprocessable(error: str, message: str, **extra) -> HTTPException:
@@ -282,6 +355,51 @@ def propagate_product_endpoint(
     return PropagateProductResponse(
         value=format_result(result.value),
         uncertainty=format_uncertainty(result.variance))
+
+
+@app.post("/solve-quantities", response_model=SolveQuantitiesResponse)
+def solve_quantities_endpoint(
+        req: SolveQuantitiesRequest) -> SolveQuantitiesResponse:
+    variables = [VariableInput(name=v.name, unit=v.unit)
+                 for v in req.variables]
+    equations = [
+        SolveEquationInput(
+            terms=tuple(TermInput(var=t.var, coefficient=t.coefficient,
+                                  unit=t.unit) for t in eq.terms),
+            rhs=RhsInput(value=eq.rhs.value, unit=eq.rhs.unit))
+        for eq in req.equations
+    ]
+    try:
+        values = solve_quantities(variables, equations)
+    except SolveUnitError as exc:
+        if exc.variable is not None:
+            where: dict = {"variable": exc.variable}
+        elif exc.term is not None:
+            where = {"equation": exc.equation, "term": exc.term}
+        else:
+            where = {"equation": exc.equation, "field": "rhs"}
+        if exc.position is not None:
+            where["position"] = exc.position
+        raise _unprocessable(exc.kind, exc.message, **where)
+    except InvalidNumberError as exc:
+        where = {"equation": exc.equation}
+        if exc.term is not None:
+            where["term"] = exc.term
+        else:
+            where["field"] = "rhs"
+        raise _unprocessable("invalid_value", exc.message, **where)
+    except TermDimensionError as exc:
+        raise _unprocessable("dimension_mismatch", exc.message,
+                             equation=exc.equation, term=exc.term)
+    except UnknownVariableError as exc:
+        raise _unprocessable("unknown_variable", exc.message,
+                             equation=exc.equation, term=exc.term,
+                             var=exc.name)
+    except SolveError as exc:
+        raise _unprocessable(exc.error, exc.message, **exc.extra)
+
+    return SolveQuantitiesResponse(values={
+        name: format_result(value) for name, value in values.items()})
 
 
 @app.get("/health")
